@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "afking",
+	"version": "${version}",
+	"name": "AFKing",
+	"description": "A client-side Fabric mod providing toggleable AFK safety automation, automatic eating, and emergency low-health disconnection.",
+	"authors": [
+		"Renan"
+	],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"dev.renan.afking.client.AFKingClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.0",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
