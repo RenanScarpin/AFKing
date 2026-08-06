@@ -3,14 +3,15 @@ package dev.renan.afking.client.behavior;
 import dev.renan.afking.client.automation.AutomationContext;
 import dev.renan.afking.client.automation.AutonomousBehavior;
 import dev.renan.afking.client.automation.BehaviorResult;
+import dev.renan.afking.client.food.FoodPolicy;
+import dev.renan.afking.client.service.InventoryService;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
 
-import java.util.Set;
+import java.util.Objects;
+import java.util.Optional;
 
 public final class AutoEatBehavior
         implements AutonomousBehavior {
@@ -19,33 +20,44 @@ public final class AutoEatBehavior
 
     private static final int PRIORITY = 800;
 
-    private static final Set<Item> ALLOWED_FOODS = Set.of(
-            Items.BREAD,
-            Items.BAKED_POTATO,
-            Items.COOKED_BEEF,
-            Items.COOKED_PORKCHOP,
-            Items.COOKED_CHICKEN,
-            Items.COOKED_MUTTON,
-            Items.COOKED_RABBIT,
-            Items.COOKED_COD,
-            Items.COOKED_SALMON,
-            Items.APPLE,
-            Items.CARROT,
-            Items.PUMPKIN_PIE
-    );
+    /*
+     * Maximum time to wait for an inventory-to-hotbar swap
+     * to become visible on the client.
+     */
+    private static final int MAX_LEASE_WAIT_TICKS = 10;
 
     private final int startEatingHunger;
     private final int stopEatingHunger;
+    private final FoodPolicy foodPolicy;
 
-    private boolean eating;
+    /*
+     * Only used when food must be selected from the hotbar
+     * or moved from the main inventory.
+     *
+     * Offhand food does not require a lease.
+     */
+    private InventoryService.HotbarLease foodLease;
+
+    /*
+     * Null while no food is actively being consumed.
+     *
+     * OFF_HAND means AFKing is eating directly from the offhand.
+     * MAIN_HAND means AFKing is using a borrowed hotbar slot.
+     */
+    private InteractionHand eatingHand;
+
     private boolean noFoodWarningShown;
 
+    /*
+     * Only relevant when using a hotbar lease.
+     */
     private int previousHotbarSlot = -1;
-    private int selectedFoodSlot = -1;
+    private int leaseWaitTicks;
 
     public AutoEatBehavior(
             int startEatingHunger,
-            int stopEatingHunger
+            int stopEatingHunger,
+            FoodPolicy foodPolicy
     ) {
         if (
                 startEatingHunger < 0
@@ -68,6 +80,11 @@ public final class AutoEatBehavior
 
         this.startEatingHunger = startEatingHunger;
         this.stopEatingHunger = stopEatingHunger;
+
+        this.foodPolicy = Objects.requireNonNull(
+                foodPolicy,
+                "foodPolicy"
+        );
     }
 
     @Override
@@ -90,12 +107,18 @@ public final class AutoEatBehavior
             return false;
         }
 
-        if (eating) {
+        /*
+         * Keep control while eating, preparing a hotbar item,
+         * or restoring an inventory lease.
+         */
+        if (eatingHand != null || foodLease != null) {
             return true;
         }
 
         int hunger =
-                client.player.getFoodData().getFoodLevel();
+                client.player
+                        .getFoodData()
+                        .getFoodLevel();
 
         return hunger <= startEatingHunger;
     }
@@ -107,76 +130,137 @@ public final class AutoEatBehavior
         Minecraft client = context.client();
 
         if (client.player == null) {
-            resetState(context, false);
+            finishEating(context, false);
             return BehaviorResult.RELEASE_CONTROL;
         }
 
         int hunger =
-                client.player.getFoodData().getFoodLevel();
+                client.player
+                        .getFoodData()
+                        .getFoodLevel();
 
-        if (eating) {
-            return continueEating(context, hunger);
-        }
-
-        if (hunger > startEatingHunger) {
+        /*
+         * Stop after reaching the target hunger level.
+         */
+        if (hunger >= stopEatingHunger) {
+            finishEating(context, true);
             noFoodWarningShown = false;
+
             return BehaviorResult.RELEASE_CONTROL;
         }
 
         /*
-         * Do not interrupt an item already being used manually.
+         * Continue an item-use action already started by AFKing.
+         */
+        if (eatingHand != null) {
+            return continueEating(context);
+        }
+
+        /*
+         * A main-inventory item was borrowed, but AFKing is still
+         * waiting for the swap to complete.
+         */
+        if (foodLease != null) {
+            return prepareLeasedFood(context);
+        }
+
+        /*
+         * No food source has been selected yet.
+         */
+        return acquireFood(context);
+    }
+
+    @Override
+    public void stop(AutomationContext context) {
+        finishEating(context, true);
+        noFoodWarningShown = false;
+    }
+
+    private BehaviorResult acquireFood(
+            AutomationContext context
+    ) {
+        Minecraft client = context.client();
+
+        /*
+         * Avoid interrupting an item-use action started manually.
          */
         if (client.player.isUsingItem()) {
             return BehaviorResult.KEEP_RUNNING;
         }
 
-        int foodSlot = findAllowedFoodInHotbar(client);
+        /*
+         * Priority 1: offhand.
+         *
+         * It requires no slot change and no inventory interaction.
+         */
+        ItemStack offhandStack =
+                client.player.getItemInHand(
+                        InteractionHand.OFF_HAND
+                );
 
-        if (foodSlot < 0) {
-            showNoFoodWarning(client);
-            return BehaviorResult.KEEP_RUNNING;
+        if (isAllowedFood(offhandStack)) {
+            eatingHand = InteractionHand.OFF_HAND;
+            noFoodWarningShown = false;
+
+            return continueEating(context);
         }
 
-        startEating(context, foodSlot);
-
-        return continueEating(context, hunger);
-    }
-
-    @Override
-    public void stop(AutomationContext context) {
-        resetState(context, true);
-    }
-
-    private void startEating(
-            AutomationContext context,
-            int foodSlot
-    ) {
-        Minecraft client = context.client();
-
+        /*
+         * Remaining priority:
+         *
+         * 2. Currently selected hotbar slot
+         * 3. Other hotbar slots
+         * 4. Main inventory
+         *
+         * InventoryService already implements this ordering.
+         */
         previousHotbarSlot =
                 client.player
                         .getInventory()
                         .getSelectedSlot();
 
-        selectedFoodSlot = foodSlot;
-        eating = true;
+        Optional<InventoryService.HotbarLease> lease =
+                context.inventory().acquireToHotbar(
+                        client,
+                        this::isAllowedFood,
+                        previousHotbarSlot
+                );
+
+        if (lease.isEmpty()) {
+            previousHotbarSlot = -1;
+
+            /*
+             * Because the offhand was checked first, this search now
+             * needs only to inspect the hotbar and main inventory.
+             */
+            boolean foodExistsInInventory =
+                    context.inventory().hasMatchingItem(
+                            client,
+                            this::isAllowedFood
+                    );
+
+            if (!foodExistsInInventory) {
+                showNoFoodWarning(client);
+            }
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
+        foodLease = lease.get();
+        leaseWaitTicks = 0;
         noFoodWarningShown = false;
 
-        client.player
-                .getInventory()
-                .setSelectedSlot(foodSlot);
+        /*
+         * Wait until the following tick before selecting or using
+         * the leased item.
+         */
+        return BehaviorResult.KEEP_RUNNING;
     }
 
-    private BehaviorResult continueEating(
-            AutomationContext context,
-            int currentHunger
+    private BehaviorResult prepareLeasedFood(
+            AutomationContext context
     ) {
         Minecraft client = context.client();
-
-        if (currentHunger >= stopEatingHunger) {
-            resetState(context, true);
-            return BehaviorResult.RELEASE_CONTROL;
-        }
 
         int currentSlot =
                 client.player
@@ -184,122 +268,168 @@ public final class AutoEatBehavior
                         .getSelectedSlot();
 
         /*
-         * Stop if the player manually changes slots.
+         * Respect manual intervention while waiting for the swap.
          */
-        if (currentSlot != selectedFoodSlot) {
-            resetState(context, false);
+        if (currentSlot != previousHotbarSlot) {
+            finishEating(context, false);
             return BehaviorResult.RELEASE_CONTROL;
         }
 
-        ItemStack selectedStack =
-                client.player.getMainHandItem();
+        if (!foodLease.isReady(client)) {
+            leaseWaitTicks++;
 
-        /*
-         * The previous food stack may have become empty.
-         */
-        if (!isAllowedFood(selectedStack)) {
-            int replacementSlot =
-                    findAllowedFoodInHotbar(client);
+            if (leaseWaitTicks > MAX_LEASE_WAIT_TICKS) {
+                finishEating(context, true);
 
-            if (replacementSlot < 0) {
-                resetState(context, true);
-                showNoFoodWarning(client);
+                client.player.sendSystemMessage(
+                        Component.literal(
+                                "AFKing: the food inventory swap "
+                                        + "did not complete."
+                        )
+                );
 
-                return BehaviorResult.KEEP_RUNNING;
-            }
-
-            selectedFoodSlot = replacementSlot;
-
-            client.player
-                    .getInventory()
-                    .setSelectedSlot(replacementSlot);
-
-            selectedStack =
-                    client.player.getMainHandItem();
-
-            if (!isAllowedFood(selectedStack)) {
-                resetState(context, true);
                 return BehaviorResult.RELEASE_CONTROL;
             }
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
+        client.player
+                .getInventory()
+                .setSelectedSlot(foodLease.hotbarSlot());
+
+        eatingHand = InteractionHand.MAIN_HAND;
+
+        return continueEating(context);
+    }
+
+    private BehaviorResult continueEating(
+            AutomationContext context
+    ) {
+        Minecraft client = context.client();
+
+        if (eatingHand == null) {
+            return BehaviorResult.RELEASE_CONTROL;
+        }
+
+        ItemStack foodStack;
+
+        if (eatingHand == InteractionHand.OFF_HAND) {
+            /*
+             * No selected-slot check is needed for offhand food.
+             *
+             * The player may change hotbar slots freely without
+             * interrupting AFKing.
+             */
+            foodStack = client.player.getItemInHand(
+                    InteractionHand.OFF_HAND
+            );
+        } else {
+            /*
+             * Main-hand eating is controlled through the leased
+             * hotbar slot.
+             */
+            if (foodLease == null) {
+                finishEating(context, false);
+                return BehaviorResult.RELEASE_CONTROL;
+            }
+
+            int currentSlot =
+                    client.player
+                            .getInventory()
+                            .getSelectedSlot();
+
+            /*
+             * A manual hotbar change cancels main-hand automation.
+             */
+            if (currentSlot != foodLease.hotbarSlot()) {
+                finishEating(context, false);
+                return BehaviorResult.RELEASE_CONTROL;
+            }
+
+            foodStack = client.player.getItemInHand(
+                    InteractionHand.MAIN_HAND
+            );
+        }
+
+        /*
+         * The stack may have been exhausted, replaced, or converted
+         * into another item, such as an empty bowl.
+         *
+         * Release the current source. If hunger remains low, the
+         * behavior will search again during a later tick.
+         */
+        if (!isAllowedFood(foodStack)) {
+            finishEating(context, true);
+            return BehaviorResult.RELEASE_CONTROL;
         }
 
         context.input().press(client.options.keyUse);
 
+        /*
+         * Explicitly start using the selected hand.
+         *
+         * This is especially important for the offhand because the
+         * main hand may contain another usable item.
+         */
         if (
                 !client.player.isUsingItem()
                         && client.gameMode != null
         ) {
             client.gameMode.useItem(
                     client.player,
-                    InteractionHand.MAIN_HAND
+                    eatingHand
             );
         }
 
         return BehaviorResult.KEEP_RUNNING;
     }
 
-    private int findAllowedFoodInHotbar(
-            Minecraft client
-    ) {
-        int currentSlot =
-                client.player
-                        .getInventory()
-                        .getSelectedSlot();
-
-        ItemStack currentStack =
-                client.player
-                        .getInventory()
-                        .getItem(currentSlot);
-
-        if (isAllowedFood(currentStack)) {
-            return currentSlot;
-        }
-
-        for (int slot = 0; slot < 9; slot++) {
-            ItemStack stack =
-                    client.player
-                            .getInventory()
-                            .getItem(slot);
-
-            if (isAllowedFood(stack)) {
-                return slot;
-            }
-        }
-
-        return -1;
-    }
-
     private boolean isAllowedFood(ItemStack stack) {
-        return !stack.isEmpty()
-                && ALLOWED_FOODS.contains(stack.getItem());
+        return foodPolicy.isAllowed(stack);
     }
 
-    private void resetState(
+    private void finishEating(
             AutomationContext context,
-            boolean restorePreviousSlot
+            boolean restorePreviousSelection
     ) {
         Minecraft client = context.client();
 
         context.input().release(client.options.keyUse);
 
-        if (
-                restorePreviousSlot
-                        && client.player != null
-                        && previousHotbarSlot >= 0
-                        && selectedFoodSlot >= 0
-                        && client.player
+        /*
+         * Offhand eating never changes the selected hotbar slot and
+         * never creates an inventory lease.
+         */
+        if (foodLease != null) {
+            int controlledHotbarSlot =
+                    foodLease.hotbarSlot();
+
+            boolean shouldRestoreSelection =
+                    restorePreviousSelection
+                            && client.player != null
+                            && previousHotbarSlot >= 0
+                            && client.player
+                            .getInventory()
+                            .getSelectedSlot()
+                            == controlledHotbarSlot;
+
+            foodLease.release(client);
+            foodLease = null;
+
+            if (
+                    shouldRestoreSelection
+                            && client.player != null
+            ) {
+                client.player
                         .getInventory()
-                        .getSelectedSlot()
-                        == selectedFoodSlot
-        ) {
-            client.player
-                    .getInventory()
-                    .setSelectedSlot(previousHotbarSlot);
+                        .setSelectedSlot(previousHotbarSlot);
+            }
         }
 
-        eating = false;
+        eatingHand = null;
         previousHotbarSlot = -1;
-        selectedFoodSlot = -1;
+        leaseWaitTicks = 0;
     }
 
     private void showNoFoodWarning(
@@ -314,7 +444,7 @@ public final class AutoEatBehavior
                     Component.literal(
                             "AFKing: hunger is low, but no "
                                     + "approved food was found "
-                                    + "in the hotbar."
+                                    + "in the offhand or inventory."
                     )
             );
         }

@@ -5,6 +5,7 @@ import dev.renan.afking.client.behavior.AutoEatBehavior;
 import dev.renan.afking.client.behavior.LowHealthDisconnectBehavior;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import dev.renan.afking.client.food.SafeFoodPolicy;
 
 public final class AFKingClient
 		implements ClientModInitializer {
@@ -13,7 +14,7 @@ public final class AFKingClient
 
 	private static final float DISCONNECT_HEALTH = 8.0F;
 
-	private static final int START_EATING_HUNGER = 14;
+	private static final int START_EATING_HUNGER = 12;
 	private static final int STOP_EATING_HUNGER = 18;
 
 	private final AFKingKeyMappings keyMappings =
@@ -34,7 +35,8 @@ public final class AFKingClient
 		controller.register(
 				new AutoEatBehavior(
 						START_EATING_HUNGER,
-						STOP_EATING_HUNGER
+						STOP_EATING_HUNGER,
+						new SafeFoodPolicy()
 				),
 				true
 		);

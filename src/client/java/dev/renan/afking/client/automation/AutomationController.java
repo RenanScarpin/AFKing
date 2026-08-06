@@ -3,6 +3,7 @@ package dev.renan.afking.client.automation;
 import dev.renan.afking.client.input.ControlledInput;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import dev.renan.afking.client.service.InventoryService;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -12,6 +13,7 @@ public final class AutomationController {
 
     private final List<BehaviorEntry> behaviors = new ArrayList<>();
     private final ControlledInput input = new ControlledInput();
+    private final InventoryService inventory = new InventoryService();
 
     private AutonomousBehavior activeBehavior;
     private boolean masterEnabled;
@@ -43,13 +45,22 @@ public final class AutomationController {
         );
     }
 
-    public void tick(Minecraft client) {
-        AutomationContext context =
-                new AutomationContext(client, input);
+    private AutomationContext createContext(
+            Minecraft client
+    ) {
+        return new AutomationContext(
+                client,
+                input,
+                inventory
+        );
+    }
 
-        /*
-         * Leaving a world always disarms AFKing.
-         */
+    public void tick(Minecraft client) {
+        inventory.tick(client);
+
+        AutomationContext context =
+                createContext(client);
+
         if (client.player == null || client.level == null) {
             if (masterEnabled || activeBehavior != null) {
                 disableSilently(context);
@@ -71,11 +82,11 @@ public final class AutomationController {
             return;
         }
 
-        BehaviorResult result = activeBehavior.tick(context);
+        BehaviorResult result =
+                activeBehavior.tick(context);
 
         switch (result) {
             case KEEP_RUNNING -> {
-                // The behavior remains active.
             }
 
             case RELEASE_CONTROL -> {
@@ -90,7 +101,7 @@ public final class AutomationController {
 
     public void toggleMaster(Minecraft client) {
         AutomationContext context =
-                new AutomationContext(client, input);
+                createContext(client);
 
         if (masterEnabled) {
             disableSilently(context);
@@ -124,7 +135,7 @@ public final class AutomationController {
                         && activeBehavior == entry.behavior
         ) {
             AutomationContext context =
-                    new AutomationContext(client, input);
+                    createContext(client);
 
             stopActiveBehavior(context);
         }
@@ -192,6 +203,7 @@ public final class AutomationController {
         masterEnabled = false;
 
         stopActiveBehavior(context);
+        inventory.releaseActiveLease(context.client());
         input.releaseAll();
     }
 
