@@ -1,4 +1,5 @@
 {
   "key.category.afking.general": "AFKing",
-  "key.aking.toggle": "Toggle automation"
+  "key.afking.toggle": "Toggle AFKing",
+  "key.afking.toggle_copper_processing": "Toggle copper processing"
 }

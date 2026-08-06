@@ -5,6 +5,8 @@ import dev.renan.afking.client.automation.AutonomousBehavior;
 import dev.renan.afking.client.automation.BehaviorResult;
 import dev.renan.afking.client.food.FoodPolicy;
 import dev.renan.afking.client.service.InventoryService;
+import dev.renan.afking.client.automation.BehaviorStopReason;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
@@ -171,7 +173,16 @@ public final class AutoEatBehavior
     }
 
     @Override
-    public void stop(AutomationContext context) {
+    public void stop(
+            AutomationContext context,
+            BehaviorStopReason reason
+    ) {
+        /*
+         * Eating does not need to preserve its exact internal state.
+         *
+         * If it is preempted and hunger remains low, it can simply
+         * acquire food again after regaining control.
+         */
         finishEating(context, true);
         noFoodWarningShown = false;
     }

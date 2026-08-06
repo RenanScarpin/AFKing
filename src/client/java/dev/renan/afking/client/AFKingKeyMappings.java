@@ -25,7 +25,21 @@ public final class AFKingKeyMappings {
                     )
             );
 
+    private final KeyMapping copperProcessingToggle =
+            KeyMappingHelper.registerKeyMapping(
+                    new KeyMapping(
+                            "key.afking.toggle_copper_processing",
+                            InputConstants.Type.KEYSYM,
+                            InputConstants.KEY_F9,
+                            CATEGORY
+                    )
+            );
+
     public boolean consumeMasterToggle() {
         return masterToggle.consumeClick();
+    }
+
+    public boolean consumeCopperProcessingToggle() {
+        return copperProcessingToggle.consumeClick();
     }
 }

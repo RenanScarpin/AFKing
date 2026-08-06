@@ -3,17 +3,27 @@ package dev.renan.afking.client.automation;
 public enum BehaviorResult {
 
     /*
-     * The behavior still needs control and should remain active.
+     * Keep this behavior active.
      */
     KEEP_RUNNING,
 
     /*
-     * The behavior completed its current action.
+     * Release control, but leave the behavior enabled.
      */
     RELEASE_CONTROL,
 
     /*
-     * AFKing should shut down completely after this tick.
+     * The behavior completed successfully and should be disabled.
+     */
+    COMPLETE_BEHAVIOR,
+
+    /*
+     * The behavior failed and should be disabled.
+     */
+    DISABLE_BEHAVIOR,
+
+    /*
+     * Disable the entire AFKing system.
      */
     DISABLE_AUTOMATION
 }

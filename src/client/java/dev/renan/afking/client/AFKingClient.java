@@ -2,10 +2,11 @@ package dev.renan.afking.client;
 
 import dev.renan.afking.client.automation.AutomationController;
 import dev.renan.afking.client.behavior.AutoEatBehavior;
+import dev.renan.afking.client.behavior.CopperProcessingBehavior;
 import dev.renan.afking.client.behavior.LowHealthDisconnectBehavior;
+import dev.renan.afking.client.food.SafeFoodPolicy;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-import dev.renan.afking.client.food.SafeFoodPolicy;
 
 public final class AFKingClient
 		implements ClientModInitializer {
@@ -14,7 +15,7 @@ public final class AFKingClient
 
 	private static final float DISCONNECT_HEALTH = 8.0F;
 
-	private static final int START_EATING_HUNGER = 12;
+	private static final int START_EATING_HUNGER = 14;
 	private static final int STOP_EATING_HUNGER = 18;
 
 	private final AFKingKeyMappings keyMappings =
@@ -41,12 +42,31 @@ public final class AFKingClient
 				true
 		);
 
+		controller.register(
+				new CopperProcessingBehavior(),
+				false
+		);
+
 		ClientTickEvents.END_CLIENT_TICK.register(
 				client -> {
+					/*
+					 * Process F8 first so pressing both keys in one
+					 * tick has predictable behavior.
+					 */
 					while (
 							keyMappings.consumeMasterToggle()
 					) {
 						controller.toggleMaster(client);
+					}
+
+					while (
+							keyMappings
+									.consumeCopperProcessingToggle()
+					) {
+						controller.toggleBehavior(
+								client,
+								CopperProcessingBehavior.ID
+						);
 					}
 
 					controller.tick(client);

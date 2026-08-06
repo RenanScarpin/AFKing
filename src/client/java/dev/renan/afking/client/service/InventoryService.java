@@ -121,6 +121,72 @@ public final class InventoryService {
     }
 
     /*
+     * Counts matching items in the normal player inventory:
+     *
+     * 0-8  = hotbar
+     * 9-35 = main inventory
+     *
+     * Equipment and offhand slots are deliberately excluded because
+     * ordinary item pickup is placed into the hotbar/main inventory.
+     */
+    public int countMatching(
+            Minecraft client,
+            Predicate<ItemStack> matcher
+    ) {
+        Objects.requireNonNull(matcher, "matcher");
+
+        if (client.player == null) {
+            return 0;
+        }
+
+        int total = 0;
+
+        for (
+                int slot = FIRST_HOTBAR_SLOT;
+                slot <= LAST_MAIN_INVENTORY_SLOT;
+                slot++
+        ) {
+            ItemStack stack =
+                    client.player
+                            .getInventory()
+                            .getItem(slot);
+
+            if (matches(stack, matcher)) {
+                total += stack.getCount();
+            }
+        }
+
+        return total;
+    }
+
+    /*
+     * Checks whether one stack can enter the regular player inventory.
+     *
+     * This succeeds when:
+     * - an empty slot exists; or
+     * - a compatible stack has remaining capacity.
+     */
+    public boolean canAccept(
+            Minecraft client,
+            ItemStack incomingStack
+    ) {
+        if (
+                client.player == null
+                        || incomingStack.isEmpty()
+        ) {
+            return false;
+        }
+
+        var inventory =
+                client.player.getInventory();
+
+        return inventory.getFreeSlot() >= 0
+                || inventory.getSlotWithRemainingSpace(
+                incomingStack
+        ) >= 0;
+    }
+
+    /*
      * Temporarily makes a matching item available in the hotbar.
      *
      * preferredHotbarSlot is normally the player's currently selected

@@ -2,31 +2,41 @@ package dev.renan.afking.client.automation;
 
 public interface AutonomousBehavior {
 
-    /*
-     * Stable identifier used for configuration and future key mappings.
-     */
     String id();
 
-    /*
-     * Higher values take control before lower values.
-     */
+    default String displayName() {
+        return id();
+    }
+
     int priority();
 
     /*
-     * Whether this behavior currently needs control.
+     * Called when the player attempts to enable this behavior.
      *
-     * This method should inspect state but should not perform actions.
+     * Return false to reject activation. For copper processing,
+     * this is where the station is captured and validated.
      */
+    default boolean arm(AutomationContext context) {
+        return true;
+    }
+
     boolean shouldRun(AutomationContext context);
 
     /*
-     * Performs one client tick of autonomous behavior.
+     * Called whenever the behavior gains execution control.
      */
+    default void start(AutomationContext context) {
+    }
+
     BehaviorResult tick(AutomationContext context);
 
-    /*
-     * Called whenever this behavior loses control.
-     */
-    default void stop(AutomationContext context) {
+    default void stop(
+            AutomationContext context,
+            BehaviorStopReason reason
+    ) {
+    }
+
+    default boolean disarmWhenAutomationStops() {
+        return false;
     }
 }
