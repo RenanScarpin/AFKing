@@ -5,7 +5,9 @@ import dev.renan.afking.client.automation.AutonomousBehavior;
 import dev.renan.afking.client.automation.BehaviorResult;
 import dev.renan.afking.client.automation.BehaviorStopReason;
 import dev.renan.afking.client.copper.CopperStation;
-import dev.renan.afking.client.copper.CopperTransformationChain;
+import dev.renan.afking.client.copper.CopperCatalog;
+import dev.renan.afking.client.copper.CopperFamily;
+import dev.renan.afking.client.copper.CopperVariant;
 import dev.renan.afking.client.copper.StationValidation;
 import dev.renan.afking.client.service.InventoryService;
 import net.minecraft.client.Minecraft;
@@ -13,11 +15,12 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.Items;
-import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.Optional;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.StringJoiner;
 
 public final class CopperProcessingBehavior
         implements AutonomousBehavior {
@@ -58,7 +61,12 @@ public final class CopperProcessingBehavior
     private static final int MAX_MINING_TICKS = 200;
 
     /*
-     * Three seconds to allow the dropped item to reach the player.
+     * Maximum time to remain blocked waiting for outstanding drops.
+     *
+     * Normally AFKing no longer waits after every block. This timeout
+     * applies only when the outstanding-drop threshold is reached or
+     * when processing has finished and remaining drops still need to
+     * be collected.
      */
     private static final int PICKUP_CONFIRMATION_TICKS = 60;
 
@@ -69,15 +77,24 @@ public final class CopperProcessingBehavior
     private static final int MIN_PICKAXE_REMAINING_DURABILITY = 10;
 
     /*
+     * AFKing will never choose an axe if completing the remaining
+     * scraping operations would leave it below this reserve.
+     */
+    private static final int MIN_AXE_REMAINING_DURABILITY = 10;
+
+    /*
+     * Number of processed copper drops that may remain temporarily
+     * uncollected while AFKing continues processing more blocks.
+     *
+     * Once this many outputs are outstanding, AFKing pauses new cycles
+     * until at least one is collected.
+     */
+    private static final int MAX_TEMPORARILY_UNCOLLECTED_ITEMS = 3;
+
+    /*
      * Short buffer between successful cycles.
      */
     private static final int INTER_CYCLE_DELAY_TICKS = 5;
-
-    /*
-     * A new Waxed Oxidized Copper block always needs four axe uses:
-     * one to remove wax and three to reverse oxidation.
-     */
-    private static final int AXE_USES_FOR_NEW_CYCLE = 4;
 
     /*
      * Number of complete blocks processed during the current F9 session.
@@ -118,7 +135,22 @@ public final class CopperProcessingBehavior
     private int miningTicks;
     private int pickupWaitTicks;
 
-    private int copperCountBeforeMining;
+    /*
+     * Number of final output items already present when this F9 session
+     * started. Combined with completedByFamily, this lets AFKing derive
+     * how many processed drops are still waiting to be collected.
+     */
+    private final Map<CopperFamily, Integer> initialOutputCountsByFamily =
+            new LinkedHashMap<>();
+
+    /*
+     * Used only while AFKing is actually blocked waiting for drops.
+     * Progress resets the pickup timeout.
+     */
+    private int lastOutstandingPickupCount;
+
+    private final Map<CopperFamily, Integer> completedByFamily =
+            new LinkedHashMap<>();
 
     /*
      * True after AFKing has begun mining the processed block.
@@ -140,10 +172,24 @@ public final class CopperProcessingBehavior
     private boolean cycleCopperPlaced;
 
     /*
-     * State recorded immediately before sending one axe interaction.
+     * Exact source selected for the current cycle.
      */
-    private Block scrapeSourceBlock;
-    private Block expectedBlockAfterScrape;
+    private CopperVariant activeSourceVariant;
+
+    /*
+     * Family being processed during the current cycle.
+     */
+    private CopperFamily activeFamily;
+
+    /*
+     * Variant observed before the latest axe interaction.
+     */
+    private CopperVariant scrapeSourceVariant;
+
+    /*
+     * Exact variant expected after one axe interaction.
+     */
+    private CopperVariant expectedVariantAfterScrape;
 
     private String completionMessage;
 
@@ -184,6 +230,9 @@ public final class CopperProcessingBehavior
         }
 
         station = capture.station();
+
+        initializeOutputBaselines(context);
+
         phase = CopperProcessingPhase.RECONCILE_WORLD;
 
         sendMessage(
@@ -413,6 +462,86 @@ public final class CopperProcessingBehavior
         return true;
     }
 
+    private void initializeOutputBaselines(
+            AutomationContext context
+    ) {
+        initialOutputCountsByFamily.clear();
+
+        for (CopperFamily family : CopperFamily.values()) {
+            initialOutputCountsByFamily.put(
+                    family,
+                    countFamilyOutput(
+                            context,
+                            family
+                    )
+            );
+        }
+    }
+
+    private int countFamilyOutput(
+            AutomationContext context,
+            CopperFamily family
+    ) {
+        return context.inventory().countMatching(
+                context.client(),
+                stack ->
+                        !stack.isEmpty()
+                                && stack.getItem()
+                                == family
+                                .finalOutput()
+                                .item()
+        );
+    }
+
+    private int outstandingPickupsForFamily(
+            AutomationContext context,
+            CopperFamily family
+    ) {
+        int processed =
+                completedByFamily.getOrDefault(
+                        family,
+                        0
+                );
+
+        int initial =
+                initialOutputCountsByFamily.getOrDefault(
+                        family,
+                        0
+                );
+
+        int current =
+                countFamilyOutput(
+                        context,
+                        family
+                );
+
+        int collectedDuringSession =
+                Math.max(
+                        0,
+                        current - initial
+                );
+
+        return Math.max(
+                0,
+                processed - collectedDuringSession
+        );
+    }
+
+    private int totalOutstandingPickups(
+            AutomationContext context
+    ) {
+        int total = 0;
+
+        for (CopperFamily family : CopperFamily.values()) {
+            total += outstandingPickupsForFamily(
+                    context,
+                    family
+            );
+        }
+
+        return total;
+    }
+
     /*
      * ------------------------------------------------------------
      * World reconciliation
@@ -428,10 +557,6 @@ public final class CopperProcessingBehavior
                 getTargetState(client);
 
         if (targetState.isAir()) {
-            /*
-             * Mining may have completed while automatic eating had
-             * control.
-             */
             if (miningCycleStarted) {
                 phase =
                         CopperProcessingPhase.WAIT_FOR_PICKUP;
@@ -439,10 +564,6 @@ public final class CopperProcessingBehavior
                 return BehaviorResult.KEEP_RUNNING;
             }
 
-            /*
-             * Copper previously existed here but disappeared before
-             * AFKing began mining it.
-             */
             if (cycleCopperPlaced) {
                 return fail(
                         client,
@@ -452,38 +573,62 @@ public final class CopperProcessingBehavior
             }
 
             /*
-             * Beginning a fresh cycle now requires a complete resource
-             * validation before another block is placed.
+             * If we were interrupted before placement, choosing a new
+             * source item is safe.
              */
+            clearActiveCycleSelection();
+
             phase =
                     CopperProcessingPhase.VALIDATE_CYCLE;
 
             return BehaviorResult.KEEP_RUNNING;
         }
 
-        if (
-                CopperTransformationChain
-                        .isSupportedState(targetState)
-        ) {
-            cycleCopperPlaced = true;
+        Optional<CopperVariant> currentVariant =
+                CopperCatalog.find(targetState);
 
-            /*
-             * If mining was interrupted while the block still exists,
-             * restart mining from observed world state.
-             */
-            miningCycleStarted = false;
-            pickupWaitTicks = 0;
-
-            phase =
-                    CopperProcessingPhase.INSPECT_COPPER;
-
-            return BehaviorResult.KEEP_RUNNING;
+        if (currentVariant.isEmpty()) {
+            return fail(
+                    client,
+                    "the station contains an unsupported block."
+            );
         }
 
-        return fail(
-                client,
-                "the station contains an unexpected block."
-        );
+        CopperVariant variant =
+                currentVariant.get();
+
+        if (
+                activeFamily != null
+                        && variant.family() != activeFamily
+        ) {
+            return fail(
+                    client,
+                    "the copper block at the station belongs "
+                            + "to a different copper family."
+            );
+        }
+
+        activeFamily = variant.family();
+        cycleCopperPlaced = true;
+
+        /*
+         * Never remove wax from an unaffected waxed block.
+         */
+        if (variant.isProtectedWaxedUnaffected()) {
+            return fail(
+                    client,
+                    "the station contains waxed unaffected copper. "
+                            + "AFKing will not remove its wax."
+            );
+        }
+
+        miningCycleStarted = false;
+        pickupWaitTicks = 0;
+
+        phase =
+                CopperProcessingPhase.INSPECT_COPPER;
+
+        return BehaviorResult.KEEP_RUNNING;
     }
 
     /*
@@ -508,25 +653,65 @@ public final class CopperProcessingBehavior
         }
 
         /*
-         * No more source blocks means the complete repetitive task
-         * finished normally.
+         * Find the next affected copper item.
+         *
+         * InventoryService already prefers:
+         *
+         * current hotbar slot
+         * → remaining hotbar
+         * → main inventory
          */
-        boolean copperExists =
-                context.inventory().hasMatchingItem(
+        Optional<InventoryService.InventorySlot> sourceSlot =
+                context.inventory().findFirst(
                         client,
-                        this::isWaxedOxidizedCopperItem
+                        CopperCatalog::isProcessableInput
                 );
 
-        if (!copperExists) {
+        if (sourceSlot.isEmpty()) {
+            int outstanding =
+                    totalOutstandingPickups(context);
+
+            if (outstanding > 0) {
+                pickupWaitTicks = 0;
+                lastOutstandingPickupCount =
+                        outstanding;
+
+                phase =
+                        CopperProcessingPhase.WAIT_FOR_PICKUP;
+
+                return BehaviorResult.KEEP_RUNNING;
+            }
+
             return complete(
                     createFinishedMessage()
             );
         }
 
+        ItemStack sourceStack =
+                client.player
+                        .getInventory()
+                        .getItem(
+                                sourceSlot.get().inventoryIndex()
+                        );
+
+        Optional<CopperVariant> sourceVariant =
+                CopperCatalog.find(sourceStack);
+
+        if (sourceVariant.isEmpty()) {
+            return fail(
+                    client,
+                    "the selected copper item could not be identified."
+            );
+        }
+
+        activeSourceVariant = sourceVariant.get();
+        activeFamily = activeSourceVariant.family();
+
+        int requiredAxeUses =
+                activeSourceVariant.requiredAxeUses();
+
         /*
-         * Check the axe before placing another block. This avoids
-         * leaving a newly placed Waxed Oxidized Copper block because
-         * no suitable axe was available.
+         * Validate the axe before placing anything.
          */
         boolean anyAxeExists =
                 context.inventory().hasMatchingItem(
@@ -546,26 +731,35 @@ public final class CopperProcessingBehavior
                         client,
                         stack -> isUsableAxe(
                                 stack,
-                                AXE_USES_FOR_NEW_CYCLE
+                                requiredAxeUses
                         )
                 );
 
         if (!usableAxeExists) {
+            int minimumRemainingDurability =
+                    MIN_AXE_REMAINING_DURABILITY
+                            + requiredAxeUses;
+
             return fail(
                     client,
-                    "no axe has the "
-                            + AXE_USES_FOR_NEW_CYCLE
-                            + " durability points required "
-                            + "for another complete cycle."
+                    "no axe has at least "
+                            + minimumRemainingDurability
+                            + " durability points remaining "
+                            + "to process the next copper item "
+                            + "while keeping a "
+                            + MIN_AXE_REMAINING_DURABILITY
+                            + "-point safety reserve."
             );
         }
 
         /*
-         * Check the pickaxe before placing another block as well.
+         * Pickaxe requirements depend on the final block belonging
+         * to the selected family.
          */
-        BlockState finalCopperState =
-                CopperTransformationChain
-                        .PLAIN
+        BlockState finalState =
+                activeFamily
+                        .finalOutput()
+                        .block()
                         .defaultBlockState();
 
         boolean anyPickaxeExists =
@@ -586,7 +780,7 @@ public final class CopperProcessingBehavior
                         client,
                         stack -> isCorrectPickaxe(
                                 stack,
-                                finalCopperState
+                                finalState
                         )
                 );
 
@@ -594,7 +788,8 @@ public final class CopperProcessingBehavior
             return fail(
                     client,
                     "no available pickaxe can harvest "
-                            + "a Block of Copper."
+                            + activeFamily.singularOutputName()
+                            + "."
             );
         }
 
@@ -603,7 +798,7 @@ public final class CopperProcessingBehavior
                         client,
                         stack -> isUsablePickaxe(
                                 stack,
-                                finalCopperState
+                                finalState
                         )
                 );
 
@@ -649,21 +844,29 @@ public final class CopperProcessingBehavior
         Optional<InventoryService.HotbarLease> lease =
                 context.inventory().acquireToHotbar(
                         client,
-                        this::isWaxedOxidizedCopperItem,
+                        this::isActiveSourceItem,
                         previousHotbarSlot
                 );
 
         if (lease.isEmpty()) {
-            boolean copperExists =
+            boolean sourceStillExists =
                     context.inventory().hasMatchingItem(
                             client,
-                            this::isWaxedOxidizedCopperItem
+                            this::isActiveSourceItem
                     );
 
-            if (!copperExists) {
-                return complete(
-                        createFinishedMessage()
-                );
+            if (!sourceStillExists) {
+                /*
+                 * Something changed in the inventory between validation and
+                 * acquisition. Select another source rather than treating the
+                 * whole batch as finished.
+                 */
+                clearActiveCycleSelection();
+
+                phase =
+                        CopperProcessingPhase.VALIDATE_CYCLE;
+
+                return BehaviorResult.KEEP_RUNNING;
             }
 
             inventoryBusyTicks++;
@@ -774,8 +977,8 @@ public final class CopperProcessingBehavior
         if (!isControlledCopperSelected(client)) {
             return fail(
                     client,
-                    "the Waxed Oxidized Copper slot "
-                            + "was changed before placement."
+                    "the selected copper slot was changed "
+                            + "before placement."
             );
         }
 
@@ -812,7 +1015,7 @@ public final class CopperProcessingBehavior
         if (!isControlledCopperSelected(client)) {
             return fail(
                     client,
-                    "Waxed Oxidized Copper is no longer selected."
+                    "the selected copper item is no longer selected."
             );
         }
 
@@ -848,15 +1051,32 @@ public final class CopperProcessingBehavior
         BlockState targetState =
                 getTargetState(client);
 
-        /*
-         * Accept any recognized processing stage. Normally this is
-         * Waxed Oxidized Copper, but this also handles an external
-         * axe interaction occurring immediately after placement.
-         */
-        if (
-                CopperTransformationChain
-                        .isSupportedState(targetState)
-        ) {
+        Optional<CopperVariant> placedVariant =
+                CopperCatalog.find(targetState);
+
+        if (placedVariant.isPresent()) {
+            CopperVariant variant =
+                    placedVariant.get();
+
+            if (
+                    activeFamily == null
+                            || variant.family() != activeFamily
+            ) {
+                return fail(
+                        client,
+                        "the placement position contains "
+                                + "a different copper family."
+                );
+            }
+
+            if (variant.isProtectedWaxedUnaffected()) {
+                return fail(
+                        client,
+                        "the placed copper unexpectedly became "
+                                + "waxed unaffected copper."
+                );
+            }
+
             cycleCopperPlaced = true;
 
             releaseCopperLease(context, true);
@@ -933,31 +1153,53 @@ public final class CopperProcessingBehavior
             );
         }
 
-        if (
-                !CopperTransformationChain
-                        .isSupportedState(targetState)
-        ) {
+        Optional<CopperVariant> found =
+                CopperCatalog.find(targetState);
+
+        if (found.isEmpty()) {
             return fail(
                     client,
                     "the station contains an unsupported block."
             );
         }
 
-        cycleCopperPlaced = true;
+        CopperVariant current =
+                found.get();
 
         if (
-                CopperTransformationChain
-                        .isFinalState(targetState)
+                activeFamily != null
+                        && current.family() != activeFamily
         ) {
-            /*
-             * Scraping is finished. Restore the axe before acquiring
-             * another tool.
-             */
+            return fail(
+                    client,
+                    "the copper family changed unexpectedly."
+            );
+        }
+
+        activeFamily = current.family();
+        cycleCopperPlaced = true;
+
+        /*
+         * Critical protection rule.
+         */
+        if (current.isProtectedWaxedUnaffected()) {
+            return fail(
+                    client,
+                    "the block is waxed and unaffected. "
+                            + "AFKing will not remove its wax."
+            );
+        }
+
+        /*
+         * Unwaxed unaffected is our final scraping target.
+         */
+        if (current.isFinalOutput()) {
             releaseAxeLease(context, true);
 
             ItemStack expectedOutput =
-                    CopperTransformationChain
-                            .PLAIN_ITEM
+                    activeFamily
+                            .finalOutput()
+                            .item()
                             .getDefaultInstance();
 
             if (
@@ -969,7 +1211,8 @@ public final class CopperProcessingBehavior
                 return fail(
                         client,
                         "the inventory has no room for "
-                                + "the processed Block of Copper."
+                                + activeFamily.singularOutputName()
+                                + "."
                 );
             }
 
@@ -980,8 +1223,7 @@ public final class CopperProcessingBehavior
         }
 
         int requiredDurability =
-                CopperTransformationChain
-                        .remainingAxeUses(targetState);
+                current.requiredAxeUses();
 
         if (axeLease != null) {
             int selectedSlot =
@@ -1025,22 +1267,38 @@ public final class CopperProcessingBehavior
     ) {
         Minecraft client = context.client();
 
-        BlockState targetState =
-                getTargetState(client);
+        Optional<CopperVariant> found =
+                CopperCatalog.find(
+                        getTargetState(client)
+                );
 
-        if (
-                !CopperTransformationChain
-                        .isSupportedState(targetState)
-        ) {
+        if (found.isEmpty()) {
             phase =
                     CopperProcessingPhase.RECONCILE_WORLD;
 
             return BehaviorResult.KEEP_RUNNING;
         }
 
+        CopperVariant current =
+                found.get();
+
+        if (current.isProtectedWaxedUnaffected()) {
+            return fail(
+                    client,
+                    "AFKing will not remove wax from "
+                            + "unaffected copper."
+            );
+        }
+
+        if (current.isFinalOutput()) {
+            phase =
+                    CopperProcessingPhase.INSPECT_COPPER;
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
         int requiredDurability =
-                CopperTransformationChain
-                        .remainingAxeUses(targetState);
+                current.requiredAxeUses();
 
         if (requiredDurability <= 0) {
             phase =
@@ -1088,12 +1346,19 @@ public final class CopperProcessingBehavior
             }
 
             if (!usableAxeExists) {
+                int minimumRemainingDurability =
+                        MIN_AXE_REMAINING_DURABILITY
+                                + requiredDurability;
+
                 return fail(
                         client,
-                        "no axe has the "
-                                + requiredDurability
-                                + " durability points required "
-                                + "to finish scraping this block."
+                        "no axe has at least "
+                                + minimumRemainingDurability
+                                + " durability points remaining "
+                                + "to finish scraping this block "
+                                + "while keeping a "
+                                + MIN_AXE_REMAINING_DURABILITY
+                                + "-point safety reserve."
                 );
             }
 
@@ -1205,9 +1470,33 @@ public final class CopperProcessingBehavior
         BlockState targetState =
                 getTargetState(client);
 
+        Optional<CopperVariant> found =
+                CopperCatalog.find(
+                        getTargetState(client)
+                );
+
+        if (found.isEmpty()) {
+            return fail(
+                    client,
+                    "the copper block changed unexpectedly."
+            );
+        }
+
+        CopperVariant current =
+                found.get();
+
+        if (
+                current.isFinalOutput()
+                        || current.isProtectedWaxedUnaffected()
+        ) {
+            phase =
+                    CopperProcessingPhase.INSPECT_COPPER;
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
         int requiredDurability =
-                CopperTransformationChain
-                        .remainingAxeUses(targetState);
+                current.requiredAxeUses();
 
         if (
                 axeLease == null
@@ -1246,34 +1535,59 @@ public final class CopperProcessingBehavior
     ) {
         Minecraft client = context.client();
 
-        BlockState currentState =
-                getTargetState(client);
+        Optional<CopperVariant> found =
+                CopperCatalog.find(
+                        getTargetState(client)
+                );
+
+        if (found.isEmpty()) {
+            return fail(
+                    client,
+                    "the block is no longer supported copper."
+            );
+        }
+
+        CopperVariant current =
+                found.get();
 
         if (
-                CopperTransformationChain
-                        .isFinalState(currentState)
+                activeFamily != null
+                        && current.family() != activeFamily
         ) {
+            return fail(
+                    client,
+                    "the copper family changed unexpectedly."
+            );
+        }
+
+        if (current.isProtectedWaxedUnaffected()) {
+            return fail(
+                    client,
+                    "AFKing will not remove wax from "
+                            + "unaffected copper."
+            );
+        }
+
+        if (current.isFinalOutput()) {
             phase =
                     CopperProcessingPhase.INSPECT_COPPER;
 
             return BehaviorResult.KEEP_RUNNING;
         }
 
-        Optional<Block> expectedNext =
-                CopperTransformationChain
-                        .expectedAfterAxe(currentState);
+        Optional<CopperVariant> expectedNext =
+                CopperCatalog.expectedAfterAxe(current);
 
         if (expectedNext.isEmpty()) {
             return fail(
                     client,
-                    "the copper block is no longer in "
-                            + "a supported scraping stage."
+                    "no safe scraping transition exists "
+                            + "for the current copper block."
             );
         }
 
         int requiredDurability =
-                CopperTransformationChain
-                        .remainingAxeUses(currentState);
+                current.requiredAxeUses();
 
         if (
                 axeLease == null
@@ -1292,10 +1606,8 @@ public final class CopperProcessingBehavior
             );
         }
 
-        scrapeSourceBlock =
-                currentState.getBlock();
-
-        expectedBlockAfterScrape =
+        scrapeSourceVariant = current;
+        expectedVariantAfterScrape =
                 expectedNext.get();
 
         boolean sent =
@@ -1327,25 +1639,36 @@ public final class CopperProcessingBehavior
     ) {
         Minecraft client = context.client();
 
-        BlockState currentState =
-                getTargetState(client);
+        Optional<CopperVariant> found =
+                CopperCatalog.find(
+                        getTargetState(client)
+                );
 
-        Block currentBlock =
-                currentState.getBlock();
+        if (found.isEmpty()) {
+            return fail(
+                    client,
+                    "the copper block changed into "
+                            + "an unexpected block."
+            );
+        }
 
+        CopperVariant current =
+                found.get();
+
+        /*
+         * Exact expected transition confirmed.
+         */
         if (
-                expectedBlockAfterScrape != null
-                        && currentBlock
-                        == expectedBlockAfterScrape
+                expectedVariantAfterScrape != null
+                        && current.equals(
+                        expectedVariantAfterScrape
+                )
         ) {
-            /*
-             * Exact expected transition confirmed.
-             */
             scrapeAttempts = 0;
             scrapeWaitTicks = 0;
 
-            scrapeSourceBlock = null;
-            expectedBlockAfterScrape = null;
+            scrapeSourceVariant = null;
+            expectedVariantAfterScrape = null;
 
             phase =
                     CopperProcessingPhase.INSPECT_COPPER;
@@ -1354,36 +1677,43 @@ public final class CopperProcessingBehavior
         }
 
         /*
-         * The block changed, but not to the exact expected stage.
+         * Something changed the block externally.
          *
-         * If it remains in the supported chain, re-inspect it. This
-         * safely handles another player scraping it at the same time.
+         * If it remains a valid member of the same copper family,
+         * re-read the state rather than blindly sending another click.
          */
         if (
-                scrapeSourceBlock != null
-                        && currentBlock != scrapeSourceBlock
+                scrapeSourceVariant != null
+                        && !current.equals(scrapeSourceVariant)
         ) {
             if (
-                    CopperTransformationChain
-                            .isSupportedState(currentState)
+                    activeFamily != null
+                            && current.family() != activeFamily
             ) {
-                scrapeAttempts = 0;
-                scrapeWaitTicks = 0;
-
-                scrapeSourceBlock = null;
-                expectedBlockAfterScrape = null;
-
-                phase =
-                        CopperProcessingPhase.INSPECT_COPPER;
-
-                return BehaviorResult.KEEP_RUNNING;
+                return fail(
+                        client,
+                        "the copper family changed unexpectedly."
+                );
             }
 
-            return fail(
-                    client,
-                    "the copper block changed into "
-                            + "an unexpected block."
-            );
+            if (current.isProtectedWaxedUnaffected()) {
+                return fail(
+                        client,
+                        "the block became waxed unaffected copper. "
+                                + "AFKing will not remove its wax."
+                );
+            }
+
+            scrapeAttempts = 0;
+            scrapeWaitTicks = 0;
+
+            scrapeSourceVariant = null;
+            expectedVariantAfterScrape = null;
+
+            phase =
+                    CopperProcessingPhase.INSPECT_COPPER;
+
+            return BehaviorResult.KEEP_RUNNING;
         }
 
         scrapeWaitTicks++;
@@ -1399,24 +1729,15 @@ public final class CopperProcessingBehavior
                 scrapeAttempts
                         >= MAX_SCRAPE_ATTEMPTS_PER_STAGE
         ) {
-            String stage =
-                    CopperTransformationChain.describe(
-                            currentState
-                    );
-
             return fail(
                     client,
-                    "the server did not confirm scraping "
-                            + stage
-                            + " after "
+                    "the server did not confirm the copper "
+                            + "scraping interaction after "
                             + scrapeAttempts
                             + " attempts."
             );
         }
 
-        /*
-         * Retry the same stage after the confirmation timeout.
-         */
         phase =
                 CopperProcessingPhase.SCRAPE_COPPER;
 
@@ -1434,35 +1755,28 @@ public final class CopperProcessingBehavior
     ) {
         Minecraft client = context.client();
 
+        if (activeFamily == null) {
+            return fail(
+                    client,
+                    "the active copper family is unknown."
+            );
+        }
+
         BlockState targetState =
                 getTargetState(client);
 
+        Optional<CopperVariant> found =
+                CopperCatalog.find(targetState);
+
         if (
-                !CopperTransformationChain
-                        .isFinalState(targetState)
+                found.isEmpty()
+                        || found.get().family() != activeFamily
+                        || !found.get().isFinalOutput()
         ) {
             phase =
                     CopperProcessingPhase.RECONCILE_WORLD;
 
             return BehaviorResult.KEEP_RUNNING;
-        }
-
-        ItemStack expectedOutput =
-                CopperTransformationChain
-                        .PLAIN_ITEM
-                        .getDefaultInstance();
-
-        if (
-                !context.inventory().canAccept(
-                        client,
-                        expectedOutput
-                )
-        ) {
-            return fail(
-                    client,
-                    "the inventory has no room for "
-                            + "the processed Block of Copper."
-            );
         }
 
         previousHotbarSlot =
@@ -1516,7 +1830,8 @@ public final class CopperProcessingBehavior
                 return fail(
                         client,
                         "no available pickaxe can harvest "
-                                + "a Block of Copper."
+                                + activeFamily.singularOutputName()
+                                + "."
                 );
             }
 
@@ -1682,46 +1997,20 @@ public final class CopperProcessingBehavior
         BlockState targetState =
                 getTargetState(client);
 
+        Optional<CopperVariant> found =
+                CopperCatalog.find(targetState);
+
         if (
-                !CopperTransformationChain
-                        .isFinalState(targetState)
+                found.isEmpty()
+                        || activeFamily == null
+                        || found.get().family() != activeFamily
+                        || !found.get().isFinalOutput()
         ) {
             phase =
                     CopperProcessingPhase.RECONCILE_WORLD;
 
             return BehaviorResult.KEEP_RUNNING;
         }
-
-        if (!isControlledPickaxeSelected(client, targetState)) {
-            return fail(
-                    client,
-                    "the required pickaxe is no longer selected."
-            );
-        }
-
-        ItemStack expectedOutput =
-                CopperTransformationChain
-                        .PLAIN_ITEM
-                        .getDefaultInstance();
-
-        if (
-                !context.inventory().canAccept(
-                        client,
-                        expectedOutput
-                )
-        ) {
-            return fail(
-                    client,
-                    "the inventory no longer has room for "
-                            + "the processed Block of Copper."
-            );
-        }
-
-        copperCountBeforeMining =
-                context.inventory().countMatching(
-                        client,
-                        this::isPlainCopperItem
-                );
 
         boolean started =
                 context.blockInteractions().startMining(
@@ -1771,9 +2060,14 @@ public final class CopperProcessingBehavior
             return BehaviorResult.KEEP_RUNNING;
         }
 
+        Optional<CopperVariant> found =
+                CopperCatalog.find(targetState);
+
         if (
-                !CopperTransformationChain
-                        .isFinalState(targetState)
+                found.isEmpty()
+                        || activeFamily == null
+                        || found.get().family() != activeFamily
+                        || !found.get().isFinalOutput()
         ) {
             context.blockInteractions().stopMining(client);
 
@@ -1805,8 +2099,9 @@ public final class CopperProcessingBehavior
 
             return fail(
                     client,
-                    "the server did not confirm that the "
-                            + "Block of Copper was mined."
+                    "the server did not confirm that "
+                            + activeFamily.singularOutputName()
+                            + " was mined."
             );
         }
 
@@ -1824,48 +2119,136 @@ public final class CopperProcessingBehavior
     ) {
         Minecraft client = context.client();
 
-        BlockState targetState =
-                getTargetState(client);
-
         /*
-         * A server correction may restore the block after the client
-         * initially observed air.
+         * ------------------------------------------------------------
+         * Case 1: we have just mined a block.
+         *
+         * WAIT_FOR_PICKUP first serves as a one-tick server correction
+         * check. We do NOT wait for the dropped item here anymore.
+         * ------------------------------------------------------------
          */
-        if (!targetState.isAir()) {
-            if (
-                    CopperTransformationChain
-                            .isFinalState(targetState)
-            ) {
-                miningCycleStarted = false;
-                miningTicks = 0;
-                pickupWaitTicks = 0;
+        if (miningCycleStarted) {
+            BlockState targetState =
+                    getTargetState(client);
 
-                phase =
-                        CopperProcessingPhase.INSPECT_COPPER;
+            /*
+             * The server restored the block after the client initially
+             * observed air.
+             */
+            if (!targetState.isAir()) {
+                Optional<CopperVariant> found =
+                        CopperCatalog.find(targetState);
 
-                return BehaviorResult.KEEP_RUNNING;
+                if (
+                        found.isPresent()
+                                && activeFamily != null
+                                && found.get().family()
+                                == activeFamily
+                                && found.get().isFinalOutput()
+                ) {
+                    miningCycleStarted = false;
+                    miningTicks = 0;
+                    pickupWaitTicks = 0;
+
+                    phase =
+                            CopperProcessingPhase.INSPECT_COPPER;
+
+                    return BehaviorResult.KEEP_RUNNING;
+                }
+
+                return fail(
+                        client,
+                        "an unexpected block appeared after mining."
+                );
             }
 
-            return fail(
-                    client,
-                    "an unexpected block appeared while "
-                            + "waiting for the copper item."
-            );
-        }
-
-        int currentCopperCount =
-                context.inventory().countMatching(
-                        client,
-                        this::isPlainCopperItem
-                );
-
-        if (
-                currentCopperCount
-                        > copperCountBeforeMining
-        ) {
+            /*
+             * The block is still gone one tick later.
+             *
+             * Count the cycle as successfully processed and immediately
+             * continue. Collection may happen asynchronously while later
+             * blocks are processed.
+             */
             return completeCurrentCycle(context);
         }
 
+        /*
+         * ------------------------------------------------------------
+         * Case 2: processing is blocked because too many drops are
+         * outstanding, or all source copper has been processed and we
+         * are waiting for the final drops.
+         * ------------------------------------------------------------
+         */
+
+        int outstanding =
+                totalOutstandingPickups(context);
+
+        boolean processableCopperRemains =
+                context.inventory().hasMatchingItem(
+                        client,
+                        CopperCatalog::isProcessableInput
+                );
+
+        /*
+         * Everything has been collected.
+         */
+        if (outstanding == 0) {
+            pickupWaitTicks = 0;
+            lastOutstandingPickupCount = 0;
+
+            if (!processableCopperRemains) {
+                return complete(
+                        createFinishedMessage()
+                );
+            }
+
+            phase =
+                    CopperProcessingPhase.VALIDATE_CYCLE;
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
+        /*
+         * At least one pending item was collected since the previous
+         * blocked tick.
+         */
+        if (
+                lastOutstandingPickupCount == 0
+                        || outstanding
+                        < lastOutstandingPickupCount
+        ) {
+            pickupWaitTicks = 0;
+        }
+
+        lastOutstandingPickupCount =
+                outstanding;
+
+        /*
+         * We were waiting because the outstanding threshold had been
+         * reached, but enough items have now been collected to safely
+         * resume.
+         */
+        if (
+                processableCopperRemains
+                        && outstanding
+                        < MAX_TEMPORARILY_UNCOLLECTED_ITEMS
+        ) {
+            pickupWaitTicks = 0;
+            lastOutstandingPickupCount = 0;
+
+            phase =
+                    CopperProcessingPhase.VALIDATE_CYCLE;
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
+        /*
+         * Either:
+         *
+         * - the outstanding threshold is still full; or
+         * - there is no source copper left, so AFKing must drain all
+         *   remaining drops before reporting successful completion.
+         */
         pickupWaitTicks++;
 
         if (
@@ -1874,8 +2257,10 @@ public final class CopperProcessingBehavior
         ) {
             return fail(
                     client,
-                    "the processed copper block was broken, "
-                            + "but its item was not collected."
+                    outstanding
+                            + " processed copper item"
+                            + (outstanding == 1 ? " remains" : "s remain")
+                            + " uncollected."
             );
         }
 
@@ -1924,6 +2309,23 @@ public final class CopperProcessingBehavior
 
         interCycleWaitTicks = 0;
 
+        int outstanding =
+                totalOutstandingPickups(context);
+
+        if (
+                outstanding
+                        >= MAX_TEMPORARILY_UNCOLLECTED_ITEMS
+        ) {
+            pickupWaitTicks = 0;
+            lastOutstandingPickupCount =
+                    outstanding;
+
+            phase =
+                    CopperProcessingPhase.WAIT_FOR_PICKUP;
+
+            return BehaviorResult.KEEP_RUNNING;
+        }
+
         phase =
                 CopperProcessingPhase.VALIDATE_CYCLE;
 
@@ -1936,14 +2338,13 @@ public final class CopperProcessingBehavior
      * ------------------------------------------------------------
      */
 
-    private boolean isWaxedOxidizedCopperItem(
+    private boolean isActiveSourceItem(
             ItemStack stack
     ) {
-        return !stack.isEmpty()
+        return activeSourceVariant != null
+                && !stack.isEmpty()
                 && stack.getItem()
-                == Items.COPPER_BLOCK
-                .waxed()
-                .oxidized();
+                == activeSourceVariant.item();
     }
 
     private boolean isAxe(ItemStack stack) {
@@ -1960,8 +2361,7 @@ public final class CopperProcessingBehavior
         }
 
         /*
-         * Non-damageable modded axes are treated as having unlimited
-         * durability.
+         * Non-damageable modded axes are effectively unlimited.
          */
         if (!stack.isDamageableItem()) {
             return true;
@@ -1971,8 +2371,21 @@ public final class CopperProcessingBehavior
                 stack.getMaxDamage()
                         - stack.getDamageValue();
 
+        /*
+         * MIN_AXE_REMAINING_DURABILITY is a reserve AFTER all remaining
+         * scraping operations have completed.
+         *
+         * Example:
+         *
+         * 14 durability remaining
+         * 4 axe uses required
+         * 10 durability remaining afterwards
+         *
+         * Accepted.
+         */
         return remainingDurability
-                >= requiredDurability;
+                >= MIN_AXE_REMAINING_DURABILITY
+                + requiredDurability;
     }
 
     private boolean isPickaxe(ItemStack stack) {
@@ -2022,7 +2435,7 @@ public final class CopperProcessingBehavior
                         - stack.getDamageValue();
 
         return remainingDurability
-                >= MIN_PICKAXE_REMAINING_DURABILITY;
+                >= MIN_PICKAXE_REMAINING_DURABILITY + 1;
     }
 
     private boolean isControlledPickaxeSelected(
@@ -2046,12 +2459,15 @@ public final class CopperProcessingBehavior
         );
     }
 
-    private boolean isPlainCopperItem(
+    private boolean isCurrentOutputItem(
             ItemStack stack
     ) {
-        return !stack.isEmpty()
+        return activeFamily != null
+                && !stack.isEmpty()
                 && stack.getItem()
-                == CopperTransformationChain.PLAIN_ITEM;
+                == activeFamily
+                .finalOutput()
+                .item();
     }
 
     private boolean isControlledCopperSelected(
@@ -2060,6 +2476,7 @@ public final class CopperProcessingBehavior
         if (
                 client.player == null
                         || copperLease == null
+                        || activeSourceVariant == null
         ) {
             return false;
         }
@@ -2068,7 +2485,7 @@ public final class CopperProcessingBehavior
                 .getInventory()
                 .getSelectedSlot()
                 == copperLease.hotbarSlot()
-                && isWaxedOxidizedCopperItem(
+                && isActiveSourceItem(
                 client.player.getMainHandItem()
         );
     }
@@ -2207,11 +2624,12 @@ public final class CopperProcessingBehavior
 
         miningTicks = 0;
         pickupWaitTicks = 0;
+        lastOutstandingPickupCount = 0;
 
         interCycleWaitTicks = 0;
 
-        scrapeSourceBlock = null;
-        expectedBlockAfterScrape = null;
+        scrapeSourceVariant = null;
+        expectedVariantAfterScrape = null;
     }
 
     private void resetSessionState() {
@@ -2224,14 +2642,23 @@ public final class CopperProcessingBehavior
         axeLease = null;
         pickaxeLease = null;
 
+        activeSourceVariant = null;
+        activeFamily = null;
+
+        scrapeSourceVariant = null;
+        expectedVariantAfterScrape = null;
+
         hasHeldControl = false;
         previousHotbarSlot = -1;
 
         miningCycleStarted = false;
         cycleCopperPlaced = false;
 
-        copperCountBeforeMining = 0;
+        initialOutputCountsByFamily.clear();
+        lastOutstandingPickupCount = 0;
+
         completedCycles = 0;
+        completedByFamily.clear();
 
         completionMessage = null;
 
@@ -2241,10 +2668,6 @@ public final class CopperProcessingBehavior
     private BehaviorResult completeCurrentCycle(
             AutomationContext context
     ) {
-        /*
-         * These should already be released, but doing it here makes the
-         * cycle boundary robust against future state-machine changes.
-         */
         context.blockInteractions().stopMining(
                 context.client()
         );
@@ -2253,21 +2676,27 @@ public final class CopperProcessingBehavior
         releaseAxeLease(context, true);
         releasePickaxeLease(context, true);
 
+        if (activeFamily == null) {
+            return fail(
+                    context.client(),
+                    "the completed copper family is unknown."
+            );
+        }
+
         completedCycles++;
 
-        /*
-         * Clear only state belonging to the completed block.
-         *
-         * The station, F9 session, behavior enablement, and completed
-         * cycle count remain intact.
-         */
+        completedByFamily.merge(
+                activeFamily,
+                1,
+                Integer::sum
+        );
+
         miningCycleStarted = false;
         cycleCopperPlaced = false;
 
-        copperCountBeforeMining = 0;
-
         completionMessage = null;
 
+        clearActiveCycleSelection();
         clearTransientActionState();
 
         phase =
@@ -2276,23 +2705,46 @@ public final class CopperProcessingBehavior
         return BehaviorResult.KEEP_RUNNING;
     }
 
+    private void clearActiveCycleSelection() {
+        activeSourceVariant = null;
+        activeFamily = null;
+    }
+
     private String createFinishedMessage() {
         if (completedCycles == 0) {
-            return "AFKing: no Waxed Oxidized Copper "
+            return "AFKing: no processable affected copper "
                     + "was found in the inventory. "
+                    + "Waxed unaffected copper is intentionally ignored. "
                     + "Copper processing is now OFF.";
         }
 
-        String processedBlocks =
-                completedCycles == 1
-                        ? "1 Block of Copper"
-                        : completedCycles
-                        + " Blocks of Copper";
+        StringJoiner processed =
+                new StringJoiner(", ");
+
+        for (
+                Map.Entry<CopperFamily, Integer> entry
+                : completedByFamily.entrySet()
+        ) {
+            CopperFamily family =
+                    entry.getKey();
+
+            int count =
+                    entry.getValue();
+
+            String name =
+                    count == 1
+                            ? family.singularOutputName()
+                            : family.pluralOutputName();
+
+            processed.add(
+                    count + " " + name
+            );
+        }
 
         return "AFKing: copper processing finished — "
-                + processedBlocks
+                + processed
                 + " processed and collected. "
-                + "No Waxed Oxidized Copper remains. "
+                + "No processable affected copper remains. "
                 + "Copper processing is now OFF.";
     }
 
