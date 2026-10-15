@@ -41,6 +41,10 @@ Careful! It will eat golden apples and other rare food items.
 
 When AFKing is enabled, it disconnects the client if the player reaches **four hearts or less**.
 
+### Copper Scrapping Toggle
+
+Press f9 to toggle copper scrapping task, it will find oxidized copper items/blocks on your inventory, place them, scrape the rust off with an axe and mine them back to your inventory with a pickaxe. It will automatically stop to not break any axes or pickaxes.
+
 ## Multiplayer usage
 
 AFKing performs client-side automation. Some multiplayer servers prohibit automated gameplay even when the mod does not bypass anti-cheat systems.
